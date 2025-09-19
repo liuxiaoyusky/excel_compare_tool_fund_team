@@ -7,3 +7,11 @@ build/
 .idea/
 .vscode/
 .DS_Store
+comparison.csv
+duplicates.csv
+summary.csv
+unmatched.csv
+diffs.csv
+VACB_FIS Recon 20250901.xlsm
+seg_mapping_config.py
+.cursor/rules/linux.mdc

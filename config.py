@@ -1,3 +1,5 @@
+from seg_mapping_config import sec_mapping
+
 bond_code_set = {
     'MR',
     'MF',
@@ -12,6 +14,4 @@ stack_code_set = {
 }
 
 
-missing_isin_or_stack_code_mapping_dict = {
-    'CB': 'S',
-}
+missing_isin_or_stack_code_mapping_dict = sec_mapping
