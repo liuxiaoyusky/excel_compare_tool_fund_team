@@ -28,9 +28,15 @@ if run_btn and spectra_file and hsbc_file:
         with tab:
             df: pd.DataFrame = result[tab_name]
             if tab_name == "diffs" and not df.empty:
-                # Web 端高亮：使用 pandas Styler 生成 HTML，按 equal 列对左右值列染色
-                def style_diffs(d: pd.DataFrame):
-                    styler = d.style
+                # 紧凑展示（固定参数）：显示所有列、紧凑密度、冻结首列、固定高度
+                compact_mode = True
+                table_height = 520
+                freeze_first_col = True
+                view_df = df
+
+                # Web 端高亮：按 base_df 的 equal 列对左右值列染色，即使视图中不显示 equal 列也可高亮
+                def style_diffs(view: pd.DataFrame, base: pd.DataFrame):
+                    styler = view.style
                     # 隐藏索引（兼容不同 pandas 版本）
                     try:
                         styler = styler.hide(axis="index")
@@ -43,12 +49,12 @@ if run_btn and spectra_file and hsbc_file:
                         left_alias = f"{field}__spectra"
                         right_alias = f"{field}__hsbc"
                         equal_col = f"{field}__equal"
-                        if equal_col in d.columns:
-                            cond = ~d[equal_col].fillna(False)
+                        if equal_col in base.columns:
+                            cond = ~base[equal_col].fillna(False)
                             colors = ["background-color: #ffff00" if v else "" for v in cond.tolist()]
-                            if left_alias in d.columns:
+                            if left_alias in view.columns:
                                 styler = styler.apply(lambda s, c=colors: c, subset=[left_alias])
-                            if right_alias in d.columns:
+                            if right_alias in view.columns:
                                 styler = styler.apply(lambda s, c=colors: c, subset=[right_alias])
                     try:
                         styler = styler.format(precision=6)
@@ -56,8 +62,50 @@ if run_btn and spectra_file and hsbc_file:
                         pass
                     return styler
 
-                styled = style_diffs(df)
-                st.markdown(styled.to_html(), unsafe_allow_html=True)
+                styled = style_diffs(view_df, df)
+
+                # 自适应滚动与粘性表头样式容器
+                css = f"""
+                <style>
+                .diff-container {{
+                    max-height: {table_height}px;
+                    overflow: auto;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 6px;
+                }}
+                .diff-container table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                .diff-container thead th {{
+                    position: sticky;
+                    top: 0;
+                    background: #ffffff;
+                    z-index: 2;
+                    box-shadow: 0 1px 0 rgba(0,0,0,0.06);
+                }}
+                .diff-container td, .diff-container th {{
+                    padding: {"4px 8px" if compact_mode else "8px 10px"};
+                    font-size: {"12px" if compact_mode else "14px"};
+                    white-space: nowrap;
+                }}
+                .diff-container tbody tr:nth-child(even) td {{
+                    background-color: #fafafa;
+                }}
+                {"" if not freeze_first_col else """
+                .diff-container tbody td:first-child,
+                .diff-container thead th:first-child {
+                    position: sticky;
+                    left: 0;
+                    background: #ffffff;
+                    z-index: 3;
+                    box-shadow: 1px 0 0 rgba(0,0,0,0.04);
+                }
+                """}
+                </style>
+                """
+                st.markdown(css, unsafe_allow_html=True)
+                st.markdown(f'<div class="diff-container">{styled.to_html()}</div>', unsafe_allow_html=True)
             else:
                 st.dataframe(df, use_container_width=True)
 
