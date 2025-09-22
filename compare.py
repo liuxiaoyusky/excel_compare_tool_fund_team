@@ -407,6 +407,34 @@ def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
     return comp[final_cols].copy()
 
 
+def build_diff_columns_series(comp: pd.DataFrame) -> pd.Series:
+    # 返回每行逗号分隔的不同 spectra 列名列表
+    df = comp.copy()
+    names = list(SPECTRA_TO_HSBC_MAP.keys())
+    equal_cols = [f"{n}__equal" for n in names]
+    # 若缺列则先补
+    for col in equal_cols:
+        if col not in df.columns:
+            df.loc[:, col] = False
+
+    def row_to_list(r):
+        diffs = []
+        for n in names:
+            col = f"{n}__equal"
+            val = r.get(col)
+            is_equal = False
+            try:
+                if pd.notna(val):
+                    is_equal = bool(val)
+            except Exception:
+                is_equal = False
+            if not is_equal:
+                diffs.append(n)
+        return ", ".join(diffs)
+
+    return df.apply(row_to_list, axis=1)
+
+
 if __name__ == "__main__":
     try:
         # 顺序执行步骤，边实现边测试
@@ -486,6 +514,11 @@ if __name__ == "__main__":
 
         export_comp = build_adjacent_export_df(comp)
         export_diffs = export_comp[export_comp["has_diff"]] if "has_diff" in export_comp.columns else export_comp.iloc[0:0]
+        # 追加 diff_columns
+        export_comp.loc[:, "diff_columns"] = build_diff_columns_series(comp)
+        if not export_diffs.empty:
+            mask_has_diff = export_comp["has_diff"] if "has_diff" in export_comp.columns else pd.Series([False] * len(export_comp))
+            export_diffs.loc[:, "diff_columns"] = build_diff_columns_series(comp[mask_has_diff])
         export_comp.to_csv(out_comparison, index=False)
         export_diffs.to_csv(out_diffs, index=False)
         # unmatched：从 comp 中筛选 hsbc 侧四列全空的行，再做相邻导出
@@ -495,12 +528,14 @@ if __name__ == "__main__":
         else:
             unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
         export_unmatched = build_adjacent_export_df(merged_fallback[unmatched_mask_export].copy())
+        export_unmatched.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(merged_fallback[unmatched_mask_export].copy()))
         export_unmatched.to_csv(out_unmatched, index=False)
         # duplicates：将 dups 视为仅有 HSBC 值的比较输入，补齐 spectra 列为 None 后构造相邻导出
         dups_for_comp = dups.copy()
         dups_for_comp = dups_for_comp[[c for c in ["id_type", "id_value", "Security ID", "Isin", "Ticker", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in dups_for_comp.columns]]
         dups_comp = build_comparison(dups_for_comp)
         export_dups = build_adjacent_export_df(dups_comp)
+        export_dups.loc[:, "diff_columns"] = build_diff_columns_series(dups_comp)
         export_dups.to_csv(out_duplicates, index=False)
 
         # summary：计数与关键清单引用（以简单的 CSV 形式输出几行统计）
