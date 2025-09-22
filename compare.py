@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 from decimal import Decimal, InvalidOperation
@@ -473,24 +474,17 @@ def _col_idx_to_excel(col_idx: int) -> str:
     return name
 
 
-def write_diffs_excel(export_diffs: pd.DataFrame, out_path: Path) -> None:
-    if export_diffs is None or export_diffs.empty:
-        # 仍然输出空表，便于流水线
-        with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-            export_diffs.to_excel(writer, sheet_name="diffs", index=False)
-        return
-
+def write_diffs_excel(export_diffs: pd.DataFrame, out_path: Path | BytesIO) -> None:
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
         sheet = "diffs"
-        export_diffs.to_excel(writer, sheet_name=sheet, index=False)
+        (export_diffs if export_diffs is not None else pd.DataFrame()).to_excel(writer, sheet_name=sheet, index=False)
+        if export_diffs is None or export_diffs.empty:
+            return
         workbook  = writer.book
         worksheet = writer.sheets[sheet]
         yellow = workbook.add_format({"bg_color": "#FFFF00"})
 
         rows = len(export_diffs)
-        if rows == 0:
-            return
-
         # 对每个字段，若 equal 列为 False，则为该行对应的 spectra/hsbc 值列着色（逐行避免偏移）
         for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
             left_alias = f"{spectra_col}__spectra"
@@ -504,7 +498,6 @@ def write_diffs_excel(export_diffs: pd.DataFrame, out_path: Path) -> None:
             equal_idx = export_diffs.columns.get_loc(equal_col)
             equal_letter = _col_idx_to_excel(equal_idx)
 
-            # 逐行应用，避免表头/相对引用造成的错位
             for r in range(rows):
                 excel_row = r + 2  # 数据第1行对应 Excel 第2行
                 formula = f"=${equal_letter}{excel_row}=FALSE"
@@ -521,6 +514,121 @@ def write_diffs_excel(export_diffs: pd.DataFrame, out_path: Path) -> None:
                 })
 
 
+def build_single_sheet_excel(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _list_sheets_from_source(source: Path | BytesIO) -> list[str]:
+    xls = pd.ExcelFile(source)
+    return xls.sheet_names
+
+
+def _pick_sheet_from_source(source: Path | BytesIO, preferred: str) -> str:
+    sheet_names = _list_sheets_from_source(source)
+    if preferred in sheet_names:
+        return preferred
+    lower_map = {name.lower(): name for name in sheet_names}
+    if preferred.lower() in lower_map:
+        return lower_map[preferred.lower()]
+    for name in sheet_names:
+        if preferred.lower() in name.lower():
+            return name
+    return sheet_names[0]
+
+
+def read_spectra_raw_from(source: Path | BytesIO) -> pd.DataFrame:
+    chosen_sheet = _pick_sheet_from_source(source, SPECTRA_SHEET)
+    return pd.read_excel(source, sheet_name=chosen_sheet, engine="xlrd", dtype=str, header=9)
+
+
+def read_hsbc_raw_from(source: Path | BytesIO) -> pd.DataFrame:
+    chosen_sheet = _pick_sheet_from_source(source, HSBC_SHEET)
+    return pd.read_excel(source, sheet_name=chosen_sheet, engine="openpyxl", dtype=str, header=12)
+
+
+def build_all_sheets_bytes(
+    export_comp: pd.DataFrame,
+    export_diffs: pd.DataFrame,
+    export_unmatched: pd.DataFrame,
+    export_dups: pd.DataFrame,
+) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        export_comp.to_excel(writer, sheet_name="comparison", index=False)
+        export_unmatched.to_excel(writer, sheet_name="unmatched", index=False)
+        export_dups.to_excel(writer, sheet_name="duplicates", index=False)
+        # diffs with highlight
+        sheet = "diffs"
+        export_diffs.to_excel(writer, sheet_name=sheet, index=False)
+        workbook = writer.book
+        worksheet = writer.sheets[sheet]
+        yellow = workbook.add_format({"bg_color": "#FFFF00"})
+        rows = len(export_diffs)
+        for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
+            left_alias = f"{spectra_col}__spectra"
+            right_alias = f"{spectra_col}__hsbc"
+            equal_col = f"{spectra_col}__equal"
+            if left_alias not in export_diffs.columns or right_alias not in export_diffs.columns or equal_col not in export_diffs.columns:
+                continue
+            left_idx = export_diffs.columns.get_loc(left_alias)
+            right_idx = export_diffs.columns.get_loc(right_alias)
+            equal_idx = export_diffs.columns.get_loc(equal_col)
+            equal_letter = _col_idx_to_excel(equal_idx)
+            for r in range(rows):
+                excel_row = r + 2
+                formula = f"=${equal_letter}{excel_row}=FALSE"
+                row_idx = r + 1
+                worksheet.conditional_format(row_idx, left_idx, row_idx, left_idx, {
+                    "type": "formula",
+                    "criteria": formula,
+                    "format": yellow,
+                })
+                worksheet.conditional_format(row_idx, right_idx, row_idx, right_idx, {
+                    "type": "formula",
+                    "criteria": formula,
+                    "format": yellow,
+                })
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def run_compare_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | BytesIO) -> dict:
+    spectra_df = read_spectra_raw_from(spectra_src)
+    spectra_norm = spectra_normalize(spectra_df)
+    hsbc_df = read_hsbc_raw_from(hsbc_src)
+    long_df, dups, hsbc_base = hsbc_build_long_table(hsbc_df)
+    merged, _ = left_join_non_dup(spectra_norm, long_df, dups)
+    merged_fallback, _, _ = apply_fallback_mapping(merged, hsbc_base)
+    comp = build_comparison(merged_fallback)
+    export_comp = build_adjacent_export_df(comp)
+    export_comp.loc[:, "diff_columns"] = build_diff_columns_series(comp)
+    export_diffs = export_comp[export_comp["has_diff"]].copy() if "has_diff" in export_comp.columns else export_comp.iloc[0:0].copy()
+    # unmatched 用 merged_fallback 判定
+    hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged_fallback.columns]
+    if hsbc_cols:
+        unmatched_mask_export = merged_fallback[hsbc_cols].isna().all(axis=1)
+    else:
+        unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
+    export_unmatched = build_adjacent_export_df(merged_fallback[unmatched_mask_export].copy())
+    export_unmatched.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(merged_fallback[unmatched_mask_export].copy()))
+    dups_for_comp = dups.copy()
+    dups_for_comp = dups_for_comp[[c for c in ["id_type", "id_value", "Security ID", "Isin", "Ticker", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in dups_for_comp.columns]]
+    dups_comp = build_comparison(dups_for_comp)
+    export_dups = build_adjacent_export_df(dups_comp)
+    export_dups.loc[:, "diff_columns"] = build_diff_columns_series(dups_comp)
+
+    all_bytes = build_all_sheets_bytes(export_comp, export_diffs, export_unmatched, export_dups)
+    return {
+        "comparison": export_comp,
+        "diffs": export_diffs,
+        "unmatched": export_unmatched,
+        "duplicates": export_dups,
+        "all_sheets_xlsx": all_bytes,
+    }
 if __name__ == "__main__":
     try:
         # 顺序执行步骤，边实现边测试
