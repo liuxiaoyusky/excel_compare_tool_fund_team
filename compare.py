@@ -156,7 +156,7 @@ def main_step1_read_files() -> int:
     return 0
 
 
-def hsbc_build_long_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def hsbc_build_long_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # 缺失补全：基于 Security ID 映射，但配置仅给出一个 dict，无法区分 ISIN/Ticker。
     # 鉴于你的要求“补全明细不需要报告”，且我们仅用于连接，采取保守策略：
     # 若 Isin 为空且 Security ID 在映射中，填充值；若 Ticker 为空且 Security ID 在映射中，也填同一值。
@@ -214,7 +214,7 @@ def hsbc_build_long_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     # 检测重复键
     dup_mask = long_df.duplicated(subset=["id_type", "id_value"], keep=False)
     dups = long_df.loc[dup_mask].copy()
-    return long_df, dups
+    return long_df, dups, base
 
 
 def left_join_non_dup(
@@ -250,6 +250,56 @@ def left_join_non_dup(
         unmatched_mask = pd.Series([True] * len(merged), index=merged.index)
     unmatched = merged[unmatched_mask].copy()
     return merged, unmatched
+
+
+def apply_fallback_mapping(
+    merged: pd.DataFrame,
+    hsbc_base: pd.DataFrame,
+) -> tuple[pd.DataFrame, int, int]:
+    # 对于未匹配行：用 id_value 在 mapping 中查 Security ID；
+    # 若命中，则在 hsbc_base 以 Security ID 精确查找；
+    # - 若找到 1 行：回填右侧列（Quantity/Price/Values），不改变输出结构；
+    # - 若找到多行：视为重复，跳过该条（不匹配）。
+    work = merged.copy()
+    updated = 0
+    dup_skipped = 0
+    # 构建 Security ID 索引映射到行位置（可能一对多）
+    if "Security ID" not in hsbc_base.columns:
+        return work, 0, 0
+    secid_groups = hsbc_base.groupby("Security ID").indices
+
+    hsbc_cols_to_copy = [c for c in ["Security ID", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in hsbc_base.columns]
+
+    for idx, row in work.iterrows():
+        # 已匹配的跳过
+        if any(pd.notna(row.get(c)) and str(row.get(c)).strip() != "" for c in hsbc_cols_to_copy):
+            continue
+        key_in = str(row["id_value"]).strip().upper()
+        mapped_secid = missing_isin_or_stack_code_mapping_dict.get(key_in)
+        if not mapped_secid:
+            continue
+        mapped_secid_up = str(mapped_secid).strip().upper()
+        if mapped_secid_up not in secid_groups:
+            continue
+        positions = secid_groups[mapped_secid_up]
+        if isinstance(positions, list) or hasattr(positions, "__len__") and len(positions) > 1:
+            dup_skipped += 1
+            continue
+        # 单行匹配
+        if hasattr(positions, "__len__") and len(positions) == 1:
+            pos = positions[0]
+        else:
+            # 某些 pandas 版本 groupby.indices 返回 ndarray
+            try:
+                pos = positions[0]
+            except Exception:
+                continue
+        rhs = hsbc_base.iloc[pos]
+        for c in hsbc_cols_to_copy:
+            work.at[idx, c] = rhs.get(c)
+        updated += 1
+
+    return work, updated, dup_skipped
 
 
 def _to_decimal(value: str) -> Decimal | None:
@@ -366,7 +416,7 @@ if __name__ == "__main__":
 
         print("[Step 2] 构建 HSBC 长表并检测重复键…")
         hsbc_df = read_hsbc_raw()
-        long_df, dups = hsbc_build_long_table(hsbc_df)
+        long_df, dups, hsbc_base = hsbc_build_long_table(hsbc_df)
         print(f"hsbc long: shape={long_df.shape}")
         print("hsbc long columns:", list(long_df.columns))
         print(f"hsbc duplicate keys: {dups[['id_type','id_value']].drop_duplicates().shape[0]}")
@@ -411,6 +461,21 @@ if __name__ == "__main__":
             print(diffs_preview.to_string(index=False))
         print("[Step 4] OK")
 
+        print("[Step 4b] 对未匹配行应用 fallback 映射并重算…")
+        merged_fallback, updated_ct, dup_skipped = apply_fallback_mapping(merged, hsbc_base)
+        print(f"fallback 更新匹配数: {updated_ct}, 因 Security ID 多行被跳过: {dup_skipped}")
+        comp = build_comparison(merged_fallback)
+        diff_count = int(comp["has_diff"].sum())
+        # 重新计算未匹配（基于 hsbc 四列是否全空）
+        hsbc_cols_check = [c for c in ["Security ID", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in merged_fallback.columns]
+        if hsbc_cols_check:
+            unmatched_mask_fb = merged_fallback[hsbc_cols_check].isna().all(axis=1)
+        else:
+            unmatched_mask_fb = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
+        unmatched_fb = merged_fallback[unmatched_mask_fb]
+        print(f"fallback 后未匹配: {unmatched_fb.shape[0]}, 差异行: {diff_count}")
+        print("[Step 4b] OK")
+
         print("[Step 5] 导出 CSV…")
         # 产出文件：comparison.csv、diffs.csv、unmatched.csv、duplicates.csv、summary.csv
         out_comparison = Path("comparison.csv")
@@ -424,12 +489,12 @@ if __name__ == "__main__":
         export_comp.to_csv(out_comparison, index=False)
         export_diffs.to_csv(out_diffs, index=False)
         # unmatched：从 comp 中筛选 hsbc 侧四列全空的行，再做相邻导出
-        hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in comp.columns]
+        hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged_fallback.columns]
         if hsbc_cols:
-            unmatched_mask_export = comp[hsbc_cols].isna().all(axis=1)
+            unmatched_mask_export = merged_fallback[hsbc_cols].isna().all(axis=1)
         else:
-            unmatched_mask_export = pd.Series([True] * len(comp), index=comp.index)
-        export_unmatched = build_adjacent_export_df(comp[unmatched_mask_export].copy())
+            unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
+        export_unmatched = build_adjacent_export_df(merged_fallback[unmatched_mask_export].copy())
         export_unmatched.to_csv(out_unmatched, index=False)
         # duplicates：将 dups 视为仅有 HSBC 值的比较输入，补齐 spectra 列为 None 后构造相邻导出
         dups_for_comp = dups.copy()
