@@ -8,6 +8,7 @@ from config import (
     bond_code_set,
     stack_code_set,
     missing_isin_or_stack_code_mapping_dict,
+    TOLERANCE_ABS,
 )
 
 
@@ -336,6 +337,10 @@ SPECTRA_TO_HSBC_MAP = {
 
 def build_comparison(merged: pd.DataFrame) -> pd.DataFrame:
     df = merged.copy()
+    try:
+        abs_tol = Decimal(str(TOLERANCE_ABS))
+    except Exception:
+        abs_tol = Decimal("0.001")
     for spectra_col, hsbc_col in SPECTRA_TO_HSBC_MAP.items():
         lhs_col = f"{spectra_col}"
         rhs_col = f"{hsbc_col}"
@@ -348,8 +353,16 @@ def build_comparison(merged: pd.DataFrame) -> pd.DataFrame:
         # 解析为 Decimal 并做严格等价比较
         lhs_num = df[lhs_col].map(_to_decimal)
         rhs_num = df[rhs_col].map(_to_decimal)
-        eq = lhs_num == rhs_num
-        df[f"{spectra_col}__equal"] = eq
+        # 等价：二者皆为 None → True；二者皆数值且 |b-a| <= 0.001 → True；其它 → False
+        equal_flags: list[bool] = []
+        for a, b in zip(lhs_num, rhs_num):
+            if a is None and b is None:
+                equal_flags.append(True)
+            elif a is None or b is None:
+                equal_flags.append(False)
+            else:
+                equal_flags.append(abs(b - a) <= abs_tol)
+        df[f"{spectra_col}__equal"] = equal_flags
         # 差值（hsbc - spectra），若任一侧为空则为空
         deltas: list[Decimal | None] = []
         for a, b in zip(lhs_num, rhs_num):
@@ -408,7 +421,7 @@ def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_diff_columns_series(comp: pd.DataFrame) -> pd.Series:
-    # 返回每行逗号分隔的不同 spectra 列名列表
+    # 返回每行逗号分隔的不同 spectra 列名列表；若为未匹配行，则输出“{id_value}不存在”
     df = comp.copy()
     names = list(SPECTRA_TO_HSBC_MAP.keys())
     equal_cols = [f"{n}__equal" for n in names]
@@ -416,6 +429,13 @@ def build_diff_columns_series(comp: pd.DataFrame) -> pd.Series:
     for col in equal_cols:
         if col not in df.columns:
             df.loc[:, col] = False
+
+    # 识别未匹配行：HSBC 四列全空
+    hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in df.columns]
+    if hsbc_cols:
+        unmatched_mask = df[hsbc_cols].isna().all(axis=1)
+    else:
+        unmatched_mask = pd.Series([False] * len(df), index=df.index)
 
     def row_to_list(r):
         diffs = []
@@ -432,7 +452,73 @@ def build_diff_columns_series(comp: pd.DataFrame) -> pd.Series:
                 diffs.append(n)
         return ", ".join(diffs)
 
-    return df.apply(row_to_list, axis=1)
+    res = df.apply(row_to_list, axis=1)
+    if unmatched_mask.any():
+        res.loc[unmatched_mask] = (
+            df.loc[unmatched_mask, "id_value"].astype(str).str.strip() + "不存在"
+        )
+    return res
+
+
+def _col_idx_to_excel(col_idx: int) -> str:
+    # 0 -> A, 25 -> Z, 26 -> AA
+    name = ""
+    n = col_idx
+    while True:
+        n, r = divmod(n, 26)
+        name = chr(65 + r) + name
+        if n == 0:
+            break
+        n -= 1
+    return name
+
+
+def write_diffs_excel(export_diffs: pd.DataFrame, out_path: Path) -> None:
+    if export_diffs is None or export_diffs.empty:
+        # 仍然输出空表，便于流水线
+        with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+            export_diffs.to_excel(writer, sheet_name="diffs", index=False)
+        return
+
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+        sheet = "diffs"
+        export_diffs.to_excel(writer, sheet_name=sheet, index=False)
+        workbook  = writer.book
+        worksheet = writer.sheets[sheet]
+        yellow = workbook.add_format({"bg_color": "#FFFF00"})
+
+        rows = len(export_diffs)
+        if rows == 0:
+            return
+
+        # 对每个字段，若 equal 列为 False，则为该行对应的 spectra/hsbc 值列着色（逐行避免偏移）
+        for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
+            left_alias = f"{spectra_col}__spectra"
+            right_alias = f"{spectra_col}__hsbc"
+            equal_col = f"{spectra_col}__equal"
+            if left_alias not in export_diffs.columns or right_alias not in export_diffs.columns or equal_col not in export_diffs.columns:
+                continue
+
+            left_idx = export_diffs.columns.get_loc(left_alias)
+            right_idx = export_diffs.columns.get_loc(right_alias)
+            equal_idx = export_diffs.columns.get_loc(equal_col)
+            equal_letter = _col_idx_to_excel(equal_idx)
+
+            # 逐行应用，避免表头/相对引用造成的错位
+            for r in range(rows):
+                excel_row = r + 2  # 数据第1行对应 Excel 第2行
+                formula = f"=${equal_letter}{excel_row}=FALSE"
+                row_idx = r + 1  # xlsxwriter 的 0-based 行号（跳过表头）
+                worksheet.conditional_format(row_idx, left_idx, row_idx, left_idx, {
+                    "type": "formula",
+                    "criteria": formula,
+                    "format": yellow,
+                })
+                worksheet.conditional_format(row_idx, right_idx, row_idx, right_idx, {
+                    "type": "formula",
+                    "criteria": formula,
+                    "format": yellow,
+                })
 
 
 if __name__ == "__main__":
@@ -513,14 +599,17 @@ if __name__ == "__main__":
         out_summary = Path("summary.csv")
 
         export_comp = build_adjacent_export_df(comp)
-        export_diffs = export_comp[export_comp["has_diff"]] if "has_diff" in export_comp.columns else export_comp.iloc[0:0]
+        export_diffs = export_comp[export_comp["has_diff"]].copy() if "has_diff" in export_comp.columns else export_comp.iloc[0:0].copy()
         # 追加 diff_columns
         export_comp.loc[:, "diff_columns"] = build_diff_columns_series(comp)
         if not export_diffs.empty:
             mask_has_diff = export_comp["has_diff"] if "has_diff" in export_comp.columns else pd.Series([False] * len(export_comp))
-            export_diffs.loc[:, "diff_columns"] = build_diff_columns_series(comp[mask_has_diff])
+            export_diffs.loc[:, "diff_columns"] = build_diff_columns_series(comp[mask_has_diff].copy())
         export_comp.to_csv(out_comparison, index=False)
         export_diffs.to_csv(out_diffs, index=False)
+        # 额外导出带黄色高亮差异的 Excel
+        out_diffs_xlsx = Path("diffs_highlight.xlsx")
+        write_diffs_excel(export_diffs, out_diffs_xlsx)
         # unmatched：从 comp 中筛选 hsbc 侧四列全空的行，再做相邻导出
         hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged_fallback.columns]
         if hsbc_cols:
