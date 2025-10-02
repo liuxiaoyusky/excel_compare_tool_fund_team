@@ -180,6 +180,16 @@ def hsbc_build_long_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
     if "Isin" in work.columns:
         work["Isin"] = work["Isin"].astype(str).str.split().str[0]
 
+    # Ticker 可能形如 "2259 HK EQUITY"，保留前两段（代码+市场），去掉尾部 EQUITY
+    if "Ticker" in work.columns:
+        work["Ticker"] = (
+            work["Ticker"].astype(str)
+            .str.replace(r"\s+EQUITY$", "", regex=True)
+            .str.split()
+            .str[:2]
+            .str.join(" ")
+        )
+
     # 列映射确认（无容差比较所需的数值列）
     value_cols = [
         "Quantity",
@@ -385,12 +395,13 @@ def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
     # - spectra security ID 来自左侧规范化后的 id_value（若无则填 None）
     # - HSBC security ID 显示为右侧的 Security ID（保留内部列名不变，仅导出时映射）
     if "spectra security ID" not in comp.columns:
-        if "id_value" in comp.columns:
-            comp.loc[:, "spectra security ID"] = comp["id_value"]
-        else:
-            comp.loc[:, "spectra security ID"] = None
+        comp = comp.assign(**{
+            "spectra security ID": (comp["id_value"] if "id_value" in comp.columns else pd.Series(dtype=object))
+        })
     if "HSBC security ID" not in comp.columns and "Security ID" in comp.columns:
-        comp.loc[:, "HSBC security ID"] = comp["Security ID"]
+        comp = comp.assign(**{
+            "HSBC security ID": comp["Security ID"]
+        })
 
     front_cols = [c for c in [
         "id_type", "id_value", "_type_raw",
@@ -406,9 +417,9 @@ def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
         equal_col = f"{spectra_col}__equal"
 
         if spectra_col not in comp.columns:
-            comp[spectra_col] = None
+            comp.loc[:, spectra_col] = pd.Series(dtype=object)
         if hsbc_col not in comp.columns:
-            comp[hsbc_col] = None
+            comp.loc[:, hsbc_col] = pd.Series(dtype=object)
 
         comp[left_alias] = comp[spectra_col]
         comp[right_alias] = comp[hsbc_col]
@@ -629,8 +640,15 @@ def run_compare_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | Bytes
         unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
     left_unmatched = merged_fallback[unmatched_mask_export].copy()
     export_unmatched_left = build_adjacent_export_df(left_unmatched)
-    export_unmatched_left.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(left_unmatched.copy()))
-    export_unmatched_left.loc[:, "source"] = "left"
+    if not export_unmatched_left.empty:
+        export_unmatched_left.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(left_unmatched.copy()))
+        export_unmatched_left.loc[:, "source"] = "left"
+    else:
+        # 保持列结构，避免后续 concat 类型不一致
+        export_unmatched_left = export_unmatched_left.assign(**{
+            "diff_columns": pd.Series(dtype=object),
+            "source": pd.Series(dtype=object),
+        })
 
     # 右侧未覆盖：比较 hsbc_base 的 Security ID 与 comparison 的 HSBC security ID
     comp_hsbc_ids = set(export_comp.get("HSBC security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
@@ -644,6 +662,11 @@ def run_compare_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | Bytes
     if not export_unmatched_right.empty:
         export_unmatched_right.loc[:, "diff_columns"] = build_diff_columns_series(comp_rhs_only)
         export_unmatched_right.loc[:, "source"] = "right"
+    else:
+        export_unmatched_right = export_unmatched_right.assign(**{
+            "diff_columns": pd.Series(dtype=object),
+            "source": pd.Series(dtype=object),
+        })
 
     export_unmatched = pd.concat([export_unmatched_left, export_unmatched_right], ignore_index=True, sort=False)
     dups_for_comp = dups.copy()
