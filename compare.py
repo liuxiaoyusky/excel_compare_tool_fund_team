@@ -381,7 +381,21 @@ def build_comparison(merged: pd.DataFrame) -> pd.DataFrame:
 
 def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
     # 构造“成对相邻”的导出 DataFrame
-    front_cols = [c for c in ["id_type", "id_value", "_type_raw", "Security ID", "Isin", "Ticker"] if c in comp.columns]
+    # 补充导出所需的 ID 列：
+    # - spectra security ID 来自左侧规范化后的 id_value（若无则填 None）
+    # - HSBC security ID 显示为右侧的 Security ID（保留内部列名不变，仅导出时映射）
+    if "spectra security ID" not in comp.columns:
+        if "id_value" in comp.columns:
+            comp.loc[:, "spectra security ID"] = comp["id_value"]
+        else:
+            comp.loc[:, "spectra security ID"] = None
+    if "HSBC security ID" not in comp.columns and "Security ID" in comp.columns:
+        comp.loc[:, "HSBC security ID"] = comp["Security ID"]
+
+    front_cols = [c for c in [
+        "id_type", "id_value", "_type_raw",
+        "spectra security ID", "HSBC security ID", "Isin", "Ticker"
+    ] if c in comp.columns]
     ordered_cols: list[str] = front_cols.copy()
 
     for spectra_col, hsbc_col in SPECTRA_TO_HSBC_MAP.items():
@@ -607,14 +621,31 @@ def run_compare_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | Bytes
     export_comp = build_adjacent_export_df(comp)
     export_comp.loc[:, "diff_columns"] = build_diff_columns_series(comp)
     export_diffs = export_comp[export_comp["has_diff"]].copy() if "has_diff" in export_comp.columns else export_comp.iloc[0:0].copy()
-    # unmatched 用 merged_fallback 判定
+    # unmatched：左侧未匹配 + 右侧未覆盖（基于 HSBC security ID 未出现于 comparison）
     hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged_fallback.columns]
     if hsbc_cols:
         unmatched_mask_export = merged_fallback[hsbc_cols].isna().all(axis=1)
     else:
         unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
-    export_unmatched = build_adjacent_export_df(merged_fallback[unmatched_mask_export].copy())
-    export_unmatched.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(merged_fallback[unmatched_mask_export].copy()))
+    left_unmatched = merged_fallback[unmatched_mask_export].copy()
+    export_unmatched_left = build_adjacent_export_df(left_unmatched)
+    export_unmatched_left.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(left_unmatched.copy()))
+    export_unmatched_left.loc[:, "source"] = "left"
+
+    # 右侧未覆盖：比较 hsbc_base 的 Security ID 与 comparison 的 HSBC security ID
+    comp_hsbc_ids = set(export_comp.get("HSBC security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
+    if "Security ID" in hsbc_base.columns:
+        hsbc_ids_all = hsbc_base["Security ID"].astype(str).str.strip().str.upper()
+        rhs_missing = hsbc_base[~hsbc_ids_all.isin(comp_hsbc_ids)].copy()
+    else:
+        rhs_missing = hsbc_base.iloc[0:0].copy()
+    comp_rhs_only = build_comparison(rhs_missing.copy()) if not rhs_missing.empty else rhs_missing.copy()
+    export_unmatched_right = build_adjacent_export_df(comp_rhs_only) if not comp_rhs_only.empty else comp_rhs_only.copy()
+    if not export_unmatched_right.empty:
+        export_unmatched_right.loc[:, "diff_columns"] = build_diff_columns_series(comp_rhs_only)
+        export_unmatched_right.loc[:, "source"] = "right"
+
+    export_unmatched = pd.concat([export_unmatched_left, export_unmatched_right], ignore_index=True, sort=False)
     dups_for_comp = dups.copy()
     dups_for_comp = dups_for_comp[[c for c in ["id_type", "id_value", "Security ID", "Isin", "Ticker", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in dups_for_comp.columns]]
     dups_comp = build_comparison(dups_for_comp)
@@ -724,8 +755,24 @@ if __name__ == "__main__":
             unmatched_mask_export = merged_fallback[hsbc_cols].isna().all(axis=1)
         else:
             unmatched_mask_export = pd.Series([True] * len(merged_fallback), index=merged_fallback.index)
-        export_unmatched = build_adjacent_export_df(merged_fallback[unmatched_mask_export].copy())
-        export_unmatched.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(merged_fallback[unmatched_mask_export].copy()))
+        left_unmatched = merged_fallback[unmatched_mask_export].copy()
+        export_unmatched_left = build_adjacent_export_df(left_unmatched)
+        export_unmatched_left.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(left_unmatched.copy()))
+        export_unmatched_left.loc[:, "source"] = "left"
+
+        comp_hsbc_ids = set(export_comp.get("HSBC security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
+        if "Security ID" in hsbc_base.columns:
+            hsbc_ids_all = hsbc_base["Security ID"].astype(str).str.strip().str.upper()
+            rhs_missing = hsbc_base[~hsbc_ids_all.isin(comp_hsbc_ids)].copy()
+        else:
+            rhs_missing = hsbc_base.iloc[0:0].copy()
+        comp_rhs_only = build_comparison(rhs_missing.copy()) if not rhs_missing.empty else rhs_missing.copy()
+        export_unmatched_right = build_adjacent_export_df(comp_rhs_only) if not comp_rhs_only.empty else comp_rhs_only.copy()
+        if not export_unmatched_right.empty:
+            export_unmatched_right.loc[:, "diff_columns"] = build_diff_columns_series(comp_rhs_only)
+            export_unmatched_right.loc[:, "source"] = "right"
+
+        export_unmatched = pd.concat([export_unmatched_left, export_unmatched_right], ignore_index=True, sort=False)
         export_unmatched.to_csv(out_unmatched, index=False)
         # duplicates：将 dups 视为仅有 HSBC 值的比较输入，补齐 spectra 列为 None 后构造相邻导出
         dups_for_comp = dups.copy()
