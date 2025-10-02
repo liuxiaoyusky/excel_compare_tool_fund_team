@@ -11,6 +11,7 @@ from config import (
     missing_isin_or_stack_code_mapping_dict,
     TOLERANCE_ABS,
 )
+import re
 
 
 SPECTRA_PATH = Path("./spectra.xls")
@@ -18,6 +19,30 @@ SPECTRA_SHEET = "Security Distribution"
 
 HSBC_PATH = Path("./HSBC Position Appraisal Report (EXCEL).xlsx")
 HSBC_SHEET = "HSBC Position Appraisal Report"
+def _normalize_ticker_value(val: object) -> str:
+    s = "" if val is None else str(val).strip().upper()
+    if s == "" or s == "NAN":
+        return s
+    # 去掉尾部 EQUITY
+    s = re.sub(r"\s+EQUITY$", "", s)
+    # 将连续空白规约为单空格
+    s = re.sub(r"\s+", " ", s)
+    parts = s.split(" ")
+    if len(parts) >= 2:
+        base, market = parts[0], parts[1]
+    else:
+        # 处理无空格的形态，如 7936JT
+        m = re.match(r"^([0-9A-Z]+)([A-Z]{2})$", s)
+        if m:
+            base, market = m.group(1), m.group(2)
+        else:
+            base, market = s, ""
+    # 市场后缀映射：UP->US, JT->JP
+    market_map = {"UP": "US", "JT": "JP"}
+    market = market_map.get(market, market)
+    # 仅保留两段
+    return (base + (" " + market if market else "")).strip()
+
 
 
 def assert_files_exist() -> None:
@@ -128,6 +153,25 @@ def spectra_normalize(df: pd.DataFrame) -> pd.DataFrame:
         "Traded Market Value (Base)",
     ]
     final = use_df[[c for c in final_cols if c in use_df.columns]].copy()
+    # 误分类纠正：若 id_type 为 ISIN 但值看起来是 ticker（如 SLV US），改判为 TICKER
+    if "id_type" in final.columns and "id_value" in final.columns:
+        val_series = final["id_value"].astype(str).str.strip().str.upper()
+        looks_like_isin = val_series.str.match(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
+        looks_like_ticker = val_series.str.match(r"^[0-9A-Z]+\s+[A-Z]{2}$") | val_series.str.match(r"^[0-9A-Z]+(JP|JT|US|UP)$")
+        mask_wrong_isin = (final["id_type"].astype(str).str.upper() == "ISIN") & (~looks_like_isin) & looks_like_ticker
+        if mask_wrong_isin.any():
+            final.loc[mask_wrong_isin, "id_type"] = "TICKER"
+            final.loc[mask_wrong_isin, "id_value"] = final.loc[mask_wrong_isin, "id_value"].map(_normalize_ticker_value)
+        # 反向纠正：若被标为 TICKER 但实际是 ISIN
+        mask_wrong_ticker = (final["id_type"].astype(str).str.upper() == "TICKER") & looks_like_isin
+        if mask_wrong_ticker.any():
+            final.loc[mask_wrong_ticker, "id_type"] = "ISIN"
+            # ISIN 保留空格前部分（若存在）
+            final.loc[mask_wrong_ticker, "id_value"] = final.loc[mask_wrong_ticker, "id_value"].astype(str).str.split().str[0]
+    # 规范化 spectra 侧的 id_value（针对 TICKER 类型做同样的市场后缀归一）
+    if "id_type" in final.columns and "id_value" in final.columns:
+        mask_ticker = final["id_type"].astype(str).str.upper() == "TICKER"
+        final.loc[mask_ticker, "id_value"] = final.loc[mask_ticker, "id_value"].map(_normalize_ticker_value)
     return final
 
 
@@ -180,19 +224,14 @@ def hsbc_build_long_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame,
     if "Isin" in work.columns:
         work["Isin"] = work["Isin"].astype(str).str.split().str[0]
 
-    # Ticker 可能形如 "2259 HK EQUITY"，保留前两段（代码+市场），去掉尾部 EQUITY
+    # 统一规范化 HSBC 的 Ticker（EQUITY 去尾、两段裁剪、市场后缀映射等）
     if "Ticker" in work.columns:
-        work["Ticker"] = (
-            work["Ticker"].astype(str)
-            .str.replace(r"\s+EQUITY$", "", regex=True)
-            .str.split()
-            .str[:2]
-            .str.join(" ")
-        )
+        work["Ticker"] = work["Ticker"].map(_normalize_ticker_value)
 
     # 列映射确认（无容差比较所需的数值列）
     value_cols = [
         "Quantity",
+        
         "Local Market Price",
         "Local Market Value",
         "Book Market Value",
@@ -281,11 +320,16 @@ def apply_fallback_mapping(
     secid_groups = hsbc_base.groupby("Security ID").indices
 
     hsbc_cols_to_copy = [c for c in ["Security ID", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in hsbc_base.columns]
+    numeric_cols_to_copy = [c for c in ["Quantity", "Local Market Price", "Local Market Value", "Book Market Value"] if c in hsbc_base.columns]
 
     for idx, row in work.iterrows():
-        # 已匹配的跳过
-        if any(pd.notna(row.get(c)) and str(row.get(c)).strip() != "" for c in hsbc_cols_to_copy):
-            continue
+        # 若四个数值列均已有值，则跳过；仅 Security ID 有值但数值列缺失时仍允许回填
+        if numeric_cols_to_copy:
+            numeric_filled_all = all(
+                (pd.notna(row.get(c)) and str(row.get(c)).strip() != "") for c in numeric_cols_to_copy
+            )
+            if numeric_filled_all:
+                continue
         key_in = str(row["id_value"]).strip().upper()
         mapped_secid = missing_isin_or_stack_code_mapping_dict.get(key_in)
         if not mapped_secid:
