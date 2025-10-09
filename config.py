@@ -64,3 +64,8 @@ missing_isin_or_stack_code_mapping_dict = _base
 
 # 绝对容差：当 |hsbc - spectra| <= 此值时视为相等
 TOLERANCE_ABS = 0.000
+
+# 历史归档开关与目录
+# 当 ENABLE_HISTORY 为 True 时，完成一次对比后将输入与输出快照保存到 HISTORY_DIR/<timestamp>/
+ENABLE_HISTORY = True
+HISTORY_DIR = Path(__file__).parent / 'history'

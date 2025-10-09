@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+from datetime import datetime
+from pathlib import Path
 
 import config
-from compare import run_compare_from_sources, build_single_sheet_excel, SPECTRA_TO_HSBC_MAP
+from compare import run_compare_from_sources, build_single_sheet_excel, SPECTRA_TO_HSBC_MAP, run_compare_spectra_vs_vpfs, run_compare_triple_from_sources
 
 
 st.set_page_config(page_title="Excel Compare", layout="wide")
@@ -21,6 +23,10 @@ if st.session_state["view"] == "compare":
         spectra_file = st.file_uploader("Upload spectra.xls", type=["xls", "xlsx"]) 
     with col2:
         hsbc_file = st.file_uploader("Upload HSBC Position Appraisal Report (EXCEL).xlsx", type=["xlsx", "xls"]) 
+
+    # VPFS 上传入口（d01 2.xls）
+    st.divider()
+    vpfs_file = st.file_uploader("Upload VPFS (d01 2.xls)", type=["xls", "xlsx"], key="vpfs_uploader")
 
     # 显示并编辑当前的 missing_isin_or_stack_code_mapping_dict
     st.subheader("Security 映射管理")
@@ -175,13 +181,105 @@ if st.session_state["view"] == "compare":
             except Exception as e:
                 st.error(f"保存失败: {e}")
 
-    run_btn = st.button("Run Compare", disabled=not (spectra_file and hsbc_file))
+    run_btn = st.button("Run Compare (Spectra↔HSBC)", disabled=not (spectra_file and hsbc_file), key="run_hsbc")
+    run_vpfs_btn = st.button("Run Spectra↔VPFS", disabled=not (spectra_file and vpfs_file), key="run_vpfs")
+    run_triple_btn = st.button("Run Triple Compare (Spectra↔HSBC↔VPFS)", disabled=not (spectra_file and hsbc_file and vpfs_file), key="run_triple")
 
     if run_btn and spectra_file and hsbc_file:
         spectra_bytes = BytesIO(spectra_file.read())
         hsbc_bytes = BytesIO(hsbc_file.read())
         with st.spinner("Comparing…"):
             result = run_compare_from_sources(spectra_bytes, hsbc_bytes)
+        # 历史归档：保存输入与输出快照
+        if getattr(config, "ENABLE_HISTORY", False):
+            try:
+                base_dir: Path = getattr(config, "HISTORY_DIR", Path(__file__).parent / "history")
+                base_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = base_dir / ts
+                suffix = 1
+                while out_dir.exists():
+                    suffix += 1
+                    out_dir = base_dir / f"{ts}_{suffix}"
+                out_dir.mkdir(parents=False, exist_ok=False)
+
+                # 写入输入快照（按原扩展名保留）
+                spectra_ext = Path(spectra_file.name).suffix or ".xls"
+                hsbc_ext = Path(hsbc_file.name).suffix or ".xlsx"
+                (out_dir / f"spectra{spectra_ext}").write_bytes(spectra_bytes.getvalue())
+                (out_dir / f"hsbc{hsbc_ext}").write_bytes(hsbc_bytes.getvalue())
+
+                # 写入输出快照
+                all_xlsx = result.get("all_sheets_xlsx")
+                if isinstance(all_xlsx, (bytes, bytearray)):
+                    (out_dir / "comparison_all.xlsx").write_bytes(all_xlsx)
+            except Exception as e:
+                st.warning(f"历史归档失败: {e}")
+        st.session_state["result"] = result
+        st.session_state["view"] = "results"
+        st.rerun()
+    # 三源对比
+    if run_triple_btn and spectra_file and hsbc_file and vpfs_file:
+        spectra_bytes = BytesIO(spectra_file.read())
+        hsbc_bytes = BytesIO(hsbc_file.read())
+        vpfs_bytes = BytesIO(vpfs_file.read())
+        with st.spinner("Comparing Spectra↔HSBC↔VPFS…"):
+            result = run_compare_triple_from_sources(spectra_bytes, hsbc_bytes, vpfs_bytes)
+        if getattr(config, "ENABLE_HISTORY", False):
+            try:
+                base_dir: Path = getattr(config, "HISTORY_DIR", Path(__file__).parent / "history")
+                base_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = base_dir / ts
+                suffix = 1
+                while out_dir.exists():
+                    suffix += 1
+                    out_dir = base_dir / f"{ts}_{suffix}"
+                out_dir.mkdir(parents=False, exist_ok=False)
+
+                spectra_ext = Path(spectra_file.name).suffix or ".xls"
+                hsbc_ext = Path(hsbc_file.name).suffix or ".xlsx"
+                vpfs_ext = Path(vpfs_file.name).suffix or ".xls"
+                (out_dir / f"spectra{spectra_ext}").write_bytes(spectra_bytes.getvalue())
+                (out_dir / f"hsbc{hsbc_ext}").write_bytes(hsbc_bytes.getvalue())
+                (out_dir / f"vpfs{vpfs_ext}").write_bytes(vpfs_bytes.getvalue())
+
+                all_xlsx = result.get("all_sheets_xlsx")
+                if isinstance(all_xlsx, (bytes, bytearray)):
+                    (out_dir / "comparison_all.xlsx").write_bytes(all_xlsx)
+            except Exception as e:
+                st.warning(f"历史归档失败: {e}")
+        st.session_state["result"] = result
+        st.session_state["view"] = "results"
+        st.rerun()
+    # VPFS 跑批
+    if run_vpfs_btn and spectra_file and vpfs_file:
+        spectra_bytes = BytesIO(spectra_file.read())
+        vpfs_bytes = BytesIO(vpfs_file.read())
+        with st.spinner("Comparing Spectra↔VPFS…"):
+            result = run_compare_spectra_vs_vpfs(spectra_bytes, vpfs_bytes)
+        if getattr(config, "ENABLE_HISTORY", False):
+            try:
+                base_dir: Path = getattr(config, "HISTORY_DIR", Path(__file__).parent / "history")
+                base_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = base_dir / ts
+                suffix = 1
+                while out_dir.exists():
+                    suffix += 1
+                    out_dir = base_dir / f"{ts}_{suffix}"
+                out_dir.mkdir(parents=False, exist_ok=False)
+
+                spectra_ext = Path(spectra_file.name).suffix or ".xls"
+                vpfs_ext = Path(vpfs_file.name).suffix or ".xls"
+                (out_dir / f"spectra{spectra_ext}").write_bytes(spectra_bytes.getvalue())
+                (out_dir / f"vpfs{vpfs_ext}").write_bytes(vpfs_bytes.getvalue())
+
+                all_xlsx = result.get("all_sheets_xlsx")
+                if isinstance(all_xlsx, (bytes, bytearray)):
+                    (out_dir / "comparison_all.xlsx").write_bytes(all_xlsx)
+            except Exception as e:
+                st.warning(f"历史归档失败: {e}")
         st.session_state["result"] = result
         st.session_state["view"] = "results"
         st.rerun()

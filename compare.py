@@ -389,6 +389,14 @@ SPECTRA_TO_HSBC_MAP = {
     "Traded Market Value (Base)": "Book Market Value",
 }
 
+# 供三源对比使用的 VPFS 列映射（在三源合并前会将 VPFS 列重命名为以下列名）
+SPECTRA_TO_VPFS_MAP = {
+    "Shares/Par": "Quantity (VPFS)",
+    "Price": "Local Market Price (VPFS)",
+    "Traded Market Value": "Local Market Value (VPFS)",
+    "Traded Market Value (Base)": "Book Market Value (VPFS)",
+}
+
 
 def build_comparison(merged: pd.DataFrame) -> pd.DataFrame:
     df = merged.copy()
@@ -592,8 +600,20 @@ def build_single_sheet_excel(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
 
 
 def _list_sheets_from_source(source: Path | BytesIO) -> list[str]:
-    xls = pd.ExcelFile(source)
-    return xls.sheet_names
+    # 智能引擎选择：先尝试 openpyxl，失败则回退到 xlrd
+    engines_to_tlry = ["openpyxl", "xlrd"]
+    last_error = None
+    
+    for engine in engines_to_tlry:
+        try:
+            xls = pd.ExcelFile(source, engine=engine)
+            return xls.sheet_names
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # 如果所有引擎都失败，抛出最后一个错误
+    raise Exception(f"无法读取 Excel 文件工作表列表，尝试了所有引擎。最后错误: {last_error}")
 
 
 def _pick_sheet_from_source(source: Path | BytesIO, preferred: str) -> str:
@@ -611,12 +631,170 @@ def _pick_sheet_from_source(source: Path | BytesIO, preferred: str) -> str:
 
 def read_spectra_raw_from(source: Path | BytesIO) -> pd.DataFrame:
     chosen_sheet = _pick_sheet_from_source(source, SPECTRA_SHEET)
-    return pd.read_excel(source, sheet_name=chosen_sheet, engine="xlrd", dtype=str, header=9)
+    # 智能引擎选择：先尝试 openpyxl，失败则回退到 xlrd
+    engines_to_tlry = ["openpyxl", "xlrd"]
+    last_error = None
+    
+    for engine in engines_to_tlry:
+        try:
+            return pd.read_excel(source, sheet_name=chosen_sheet, engine=engine, dtype=str, header=9)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # 如果所有引擎都失败，抛出最后一个错误
+    raise Exception(f"无法读取 Excel 文件，尝试了所有引擎。最后错误: {last_error}")
 
 
 def read_hsbc_raw_from(source: Path | BytesIO) -> pd.DataFrame:
     chosen_sheet = _pick_sheet_from_source(source, HSBC_SHEET)
-    return pd.read_excel(source, sheet_name=chosen_sheet, engine="openpyxl", dtype=str, header=12)
+    # 智能引擎选择：先尝试 openpyxl，失败则回退到 xlrd
+    engines_to_tlry = ["openpyxl", "xlrd"]
+    last_error = None
+    
+    for engine in engines_to_tlry:
+        try:
+            return pd.read_excel(source, sheet_name=chosen_sheet, engine=engine, dtype=str, header=12)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # 如果所有引擎都失败，抛出最后一个错误
+    raise Exception(f"无法读取 Excel 文件，尝试了所有引擎。最后错误: {last_error}")
+
+
+# === VPFS 支持（d01 2.xls） ===
+def read_vpfs_raw_from(source: Path | BytesIO) -> pd.DataFrame:
+    # VPFS 文件通常为 .xls，采用第一个工作表
+    # 行头未知，按默认首行作为表头读取，保留字符串类型
+    chosen_sheet = _pick_sheet_from_source(source, "")
+    # 智能引擎选择：先尝试 xlrd（适合 .xls），失败则尝试 openpyxl
+    engines_to_tlry = ["xlrd", "openpyxl"]
+    last_error = None
+    
+    for engine in engines_to_tlry:
+        try:
+            return pd.read_excel(source, sheet_name=chosen_sheet, engine=engine, dtype=str)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # 如果所有引擎都失败，抛出最后一个错误
+    raise Exception(f"无法读取 VPFS Excel 文件，尝试了所有引擎。最后错误: {last_error}")
+
+
+def vpfs_normalize(df: pd.DataFrame) -> pd.DataFrame:
+    # 列名归一化为小写并去空白，避免大小写与空格差异
+    cols_map = {c: str(c).strip() for c in df.columns}
+    df = df.rename(columns=cols_map)
+    lower_map = {str(c).strip(): str(c).strip().lower() for c in df.columns}
+    df.columns = [lower_map[str(c).strip()] for c in df.columns]
+
+    work = df.copy()
+    # 过滤 rowid == listing（不区分大小写）
+    if "rowid" in work.columns:
+        work = work[work["rowid"].astype(str).str.strip().str.lower() == "listing"].copy()
+    # 丢弃 prodid 为空
+    if "prodid" in work.columns:
+        work = work[work["prodid"].astype(str).str.strip() != ""].copy()
+        # 跳过 prodid == zzzzzz（不区分大小写）
+        mask_skip = work["prodid"].astype(str).str.strip().str.lower() == "zzzzzz"
+        if mask_skip.any():
+            work = work[~mask_skip].copy()
+    else:
+        # 无 prodid 列则返回空框架，后续合并为完全未匹配
+        return pd.DataFrame(columns=["prodid_norm", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"])  # type: ignore[list-item]
+
+    # 规范化 prodid 作为连接键
+    work.loc[:, "prodid_norm"] = work["prodid"].astype(str).str.strip().str.upper()
+
+    # 将 VPFS 数值列映射为右侧标准列（沿用 HSBC 列名，以便复用比较/导出逻辑）
+    # 映射关系：valqty→Quantity，valprice→Local Market Price，MarketValue→Local Market Value，FundCCYTotalCost→Book Market Value
+    target_cols = {
+        "valqty": "Quantity",
+        "valprice": "Local Market Price",
+        "marketvalue": "Local Market Value",
+        "fundccytotalcost": "Book Market Value",
+    }
+    present = {src: tgt for src, tgt in target_cols.items() if src in work.columns}
+    use_cols = ["prodid_norm"] + list(present.keys())
+    use = work[use_cols].copy()
+    use = use.rename(columns=present)
+    # 确保所有目标列存在（缺失列补空）
+    for tgt in target_cols.values():
+        if tgt not in use.columns:
+            use.loc[:, tgt] = pd.Series(dtype=object)
+    return use[["prodid_norm", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"]].copy()
+
+
+def run_compare_spectra_vs_vpfs(spectra_src: Path | BytesIO, vpfs_src: Path | BytesIO) -> dict:
+    # 读取并标准化左侧 Spectra
+    spectra_df = read_spectra_raw_from(spectra_src)
+    spectra_norm = spectra_normalize(spectra_df)
+    # 读取并标准化 VPFS（右侧）
+    vpfs_df = read_vpfs_raw_from(vpfs_src)
+    vpfs_norm = vpfs_normalize(vpfs_df)
+
+    # 以 id_value（左）对 prodid_norm（右）左连接
+    merged = spectra_norm.merge(
+        vpfs_norm,
+        left_on="id_value",
+        right_on="prodid_norm",
+        how="left",
+        suffixes=("_spectra", "_vpfs"),
+    )
+    # 比较（沿用 SPECTRA_TO_HSBC_MAP）
+    comp = build_comparison(merged)
+    export_comp = build_adjacent_export_df(comp)
+    export_comp.loc[:, "diff_columns"] = build_diff_columns_series(comp)
+    export_diffs = export_comp[export_comp.get("has_diff", pd.Series([False] * len(export_comp))).astype(bool)].copy()
+
+    # 左侧未匹配：右侧四列均为空
+    rhs_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged.columns]
+    if rhs_cols:
+        unmatched_mask_export = merged[rhs_cols].isna().all(axis=1)
+    else:
+        unmatched_mask_export = pd.Series([True] * len(merged), index=merged.index)
+    left_unmatched = merged[unmatched_mask_export].copy()
+    export_unmatched_left = build_adjacent_export_df(build_comparison(left_unmatched.copy()) if not left_unmatched.empty else left_unmatched.copy())
+    if not export_unmatched_left.empty:
+        export_unmatched_left.loc[:, "diff_columns"] = build_diff_columns_series(build_comparison(left_unmatched.copy()))
+        export_unmatched_left.loc[:, "source"] = "left"
+    else:
+        export_unmatched_left = export_unmatched_left.assign(**{
+            "diff_columns": pd.Series(dtype=object),
+            "source": pd.Series(dtype=object),
+        })
+
+    # 右侧未覆盖：VPFS prodid_norm 不在 spectra 的 id_value 中
+    spectra_ids = set(export_comp.get("spectra security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
+    if "prodid_norm" in vpfs_norm.columns:
+        vpfs_only = vpfs_norm[~vpfs_norm["prodid_norm"].astype(str).str.strip().str.upper().isin(spectra_ids)].copy()
+    else:
+        vpfs_only = vpfs_norm.iloc[0:0].copy()
+    comp_rhs_only = build_comparison(vpfs_only.copy()) if not vpfs_only.empty else vpfs_only.copy()
+    export_unmatched_right = build_adjacent_export_df(comp_rhs_only) if not comp_rhs_only.empty else comp_rhs_only.copy()
+    if not export_unmatched_right.empty:
+        export_unmatched_right.loc[:, "diff_columns"] = build_diff_columns_series(comp_rhs_only)
+        export_unmatched_right.loc[:, "source"] = "right"
+    else:
+        export_unmatched_right = export_unmatched_right.assign(**{
+            "diff_columns": pd.Series(dtype=object),
+            "source": pd.Series(dtype=object),
+        })
+
+    export_unmatched = pd.concat([export_unmatched_left, export_unmatched_right], ignore_index=True, sort=False)
+    # VPFS 无重复键检测，提供空表结构
+    export_dups = pd.DataFrame(columns=export_comp.columns)
+
+    all_bytes = build_all_sheets_bytes(export_comp, export_diffs, export_unmatched, export_dups)
+    return {
+        "comparison": export_comp,
+        "diffs": export_diffs,
+        "unmatched": export_unmatched,
+        "duplicates": export_dups,
+        "all_sheets_xlsx": all_bytes,
+    }
 
 
 def build_all_sheets_bytes(
@@ -725,6 +903,274 @@ def run_compare_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | Bytes
         "diffs": export_diffs,
         "unmatched": export_unmatched,
         "duplicates": export_dups,
+        "all_sheets_xlsx": all_bytes,
+    }
+
+
+# ===== 三源对比：Spectra ↔ HSBC ↔ VPFS =====
+def _vpfs_for_triple(vpfs_norm: pd.DataFrame) -> pd.DataFrame:
+    # 将 VPFS 标准列重命名为带 (VPFS) 后缀，避免与 HSBC 列冲突
+    rename_map = {
+        "Quantity": "Quantity (VPFS)",
+        "Local Market Price": "Local Market Price (VPFS)",
+        "Local Market Value": "Local Market Value (VPFS)",
+        "Book Market Value": "Book Market Value (VPFS)",
+    }
+    work = vpfs_norm.copy()
+    for src, tgt in rename_map.items():
+        if src in work.columns:
+            work = work.rename(columns={src: tgt})
+        else:
+            work.loc[:, tgt] = pd.Series(dtype=object)
+    return work
+
+
+def build_triple_comparison(merged: pd.DataFrame) -> pd.DataFrame:
+    df = merged.copy()
+    try:
+        abs_tol = Decimal(str(TOLERANCE_ABS))
+    except Exception:
+        abs_tol = Decimal("0.001")
+    # 针对每个字段，对 HSBC 与 VPFS 分别计算等价与差值
+    for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
+        lhs_col = spectra_col
+        hsbc_col = SPECTRA_TO_HSBC_MAP[spectra_col]
+        vpfs_col = SPECTRA_TO_VPFS_MAP[spectra_col]
+        if lhs_col not in df.columns:
+            df[lhs_col] = None
+        if hsbc_col not in df.columns:
+            df[hsbc_col] = None
+        if vpfs_col not in df.columns:
+            df[vpfs_col] = None
+
+        lhs_num = df[lhs_col].map(_to_decimal)
+        rhs_hsbc = df[hsbc_col].map(_to_decimal)
+        rhs_vpfs = df[vpfs_col].map(_to_decimal)
+
+        eq_hsbc: list[bool] = []
+        eq_vpfs: list[bool] = []
+        delta_hsbc: list[Decimal | None] = []
+        delta_vpfs: list[Decimal | None] = []
+        for a, b_h, b_v in zip(lhs_num, rhs_hsbc, rhs_vpfs):
+            # hsbc
+            if a is None and b_h is None:
+                eq_hsbc.append(True)
+            elif a is None or b_h is None:
+                eq_hsbc.append(False)
+            else:
+                eq_hsbc.append(abs(b_h - a) <= abs_tol)
+            if a is None or b_h is None:
+                delta_hsbc.append(None)
+            else:
+                delta_hsbc.append((b_h - a).normalize())
+            # vpfs
+            if a is None and b_v is None:
+                eq_vpfs.append(True)
+            elif a is None or b_v is None:
+                eq_vpfs.append(False)
+            else:
+                eq_vpfs.append(abs(b_v - a) <= abs_tol)
+            if a is None or b_v is None:
+                delta_vpfs.append(None)
+            else:
+                delta_vpfs.append((b_v - a).normalize())
+
+        df[f"{spectra_col}__equal_hsbc"] = eq_hsbc
+        df[f"{spectra_col}__delta_hsbc"] = delta_hsbc
+        df[f"{spectra_col}__equal_vpfs"] = eq_vpfs
+        df[f"{spectra_col}__delta_vpfs"] = delta_vpfs
+
+    eq_cols_all = [f"{c}__equal_hsbc" for c in SPECTRA_TO_HSBC_MAP.keys()] + [f"{c}__equal_vpfs" for c in SPECTRA_TO_HSBC_MAP.keys()]
+    df["has_diff"] = ~df[eq_cols_all].all(axis=1)
+    return df
+
+
+def build_triple_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
+    work = comp.copy()
+    # 统一前置列
+    if "spectra security ID" not in work.columns:
+        work = work.assign(**{
+            "spectra security ID": (work["id_value"] if "id_value" in work.columns else pd.Series(dtype=object))
+        })
+    if "HSBC security ID" not in work.columns and "Security ID" in work.columns:
+        work = work.assign(**{
+            "HSBC security ID": work["Security ID"]
+        })
+
+    front_cols = [c for c in [
+        "id_type", "id_value", "_type_raw",
+        "spectra security ID", "HSBC security ID", "Isin", "Ticker"
+    ] if c in work.columns]
+    ordered_cols: list[str] = front_cols.copy()
+
+    for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
+        left_alias = f"{spectra_col}__spectra"
+        hsbc_alias = f"{spectra_col}__hsbc"
+        vpfs_alias = f"{spectra_col}__vpfs"
+        hsbc_col = SPECTRA_TO_HSBC_MAP[spectra_col]
+        vpfs_col = SPECTRA_TO_VPFS_MAP[spectra_col]
+        # 确保基础列存在
+        for col in [spectra_col, hsbc_col, vpfs_col]:
+            if col not in work.columns:
+                work.loc[:, col] = pd.Series(dtype=object)
+        # 生成别名列
+        work[left_alias] = work[spectra_col]
+        work[hsbc_alias] = work[hsbc_col]
+        work[vpfs_alias] = work[vpfs_col]
+        # 追加顺序：左、HSBC、VPFS、两个 delta（若有）、两个 equal（若有）
+        ordered_cols += [left_alias, hsbc_alias, vpfs_alias]
+        for suffix in ["delta_hsbc", "delta_vpfs", "equal_hsbc", "equal_vpfs"]:
+            coln = f"{spectra_col}__{suffix}"
+            if coln in work.columns:
+                ordered_cols.append(coln)
+
+    if "has_diff" in work.columns:
+        ordered_cols.append("has_diff")
+
+    seen = set()
+    final_cols = []
+    for c in ordered_cols:
+        if c in work.columns and c not in seen:
+            seen.add(c)
+            final_cols.append(c)
+    return work[final_cols].copy()
+
+
+def build_triple_diff_columns_series(comp: pd.DataFrame) -> pd.Series:
+    df = comp.copy()
+    names = list(SPECTRA_TO_HSBC_MAP.keys())
+    for col in [f"{n}__equal_hsbc" for n in names] + [f"{n}__equal_vpfs" for n in names]:
+        if col not in df.columns:
+            df.loc[:, col] = False
+    def row_to_list(r):
+        diffs = []
+        for n in names:
+            if not bool(r.get(f"{n}__equal_hsbc", False)):
+                diffs.append(f"{n}(hsbc)")
+            if not bool(r.get(f"{n}__equal_vpfs", False)):
+                diffs.append(f"{n}(vpfs)")
+        return ", ".join(diffs)
+    return df.apply(row_to_list, axis=1)
+
+
+def build_triple_all_sheets_bytes(export_comp: pd.DataFrame, export_diffs: pd.DataFrame, export_unmatched: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        export_comp.to_excel(writer, sheet_name="comparison", index=False)
+        export_unmatched.to_excel(writer, sheet_name="unmatched", index=False)
+        sheet = "diffs"
+        export_diffs.to_excel(writer, sheet_name=sheet, index=False)
+        if not export_diffs.empty:
+            workbook = writer.book
+            worksheet = writer.sheets[sheet]
+            yellow = workbook.add_format({"bg_color": "#FFFF00"})
+            rows = len(export_diffs)
+            for spectra_col in SPECTRA_TO_HSBC_MAP.keys():
+                left_alias = f"{spectra_col}__spectra"
+                for side in ["hsbc", "vpfs"]:
+                    right_alias = f"{spectra_col}__{side}"
+                    equal_col = f"{spectra_col}__equal_{side}"
+                    if left_alias not in export_diffs.columns or right_alias not in export_diffs.columns or equal_col not in export_diffs.columns:
+                        continue
+                    left_idx = export_diffs.columns.get_loc(left_alias)
+                    right_idx = export_diffs.columns.get_loc(right_alias)
+                    equal_idx = export_diffs.columns.get_loc(equal_col)
+                    equal_letter = _col_idx_to_excel(equal_idx)
+                    for r in range(rows):
+                        excel_row = r + 2
+                        formula = f"=${equal_letter}{excel_row}=FALSE"
+                        row_idx = r + 1
+                        worksheet.conditional_format(row_idx, left_idx, row_idx, left_idx, {
+                            "type": "formula",
+                            "criteria": formula,
+                            "format": yellow,
+                        })
+                        worksheet.conditional_format(row_idx, right_idx, row_idx, right_idx, {
+                            "type": "formula",
+                            "criteria": formula,
+                            "format": yellow,
+                        })
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def run_compare_triple_from_sources(spectra_src: Path | BytesIO, hsbc_src: Path | BytesIO, vpfs_src: Path | BytesIO) -> dict:
+    # 左：Spectra
+    spectra_df = read_spectra_raw_from(spectra_src)
+    spectra_norm = spectra_normalize(spectra_df)
+    # 右1：HSBC（含 fallback）
+    hsbc_df = read_hsbc_raw_from(hsbc_src)
+    long_df, dups, hsbc_base = hsbc_build_long_table(hsbc_df)
+    merged, _ = left_join_non_dup(spectra_norm, long_df, dups)
+    merged_fb, _, _ = apply_fallback_mapping(merged, hsbc_base)
+    # 右2：VPFS
+    vpfs_df = read_vpfs_raw_from(vpfs_src)
+    vpfs_norm = vpfs_normalize(vpfs_df)
+    vpfs_triple = _vpfs_for_triple(vpfs_norm)
+    # 合并 VPFS（避免覆盖 HSBC 列）
+    merged_triple = merged_fb.merge(
+        vpfs_triple,
+        left_on="id_value",
+        right_on="prodid_norm",
+        how="left",
+        suffixes=(None, None),
+    )
+
+    triple_comp = build_triple_comparison(merged_triple)
+    export_comp = build_triple_adjacent_export_df(triple_comp)
+    export_comp.loc[:, "diff_columns"] = build_triple_diff_columns_series(triple_comp)
+    export_diffs = export_comp[export_comp.get("has_diff", pd.Series([False] * len(export_comp))).astype(bool)].copy()
+
+    # 未匹配（左）：HSBC 四列全空 或 VPFS 四列全空
+    hsbc_cols = [v for v in SPECTRA_TO_HSBC_MAP.values() if v in merged_triple.columns]
+    vpfs_cols = [v for v in SPECTRA_TO_VPFS_MAP.values() if v in merged_triple.columns]
+    left_unmatched_frames = []
+    if hsbc_cols:
+        mask_hsbc_unmatched = merged_triple[hsbc_cols].isna().all(axis=1)
+        left_unmatched_frames.append(merged_triple[mask_hsbc_unmatched].assign(source="left_vs_hsbc"))
+    if vpfs_cols:
+        mask_vpfs_unmatched = merged_triple[vpfs_cols].isna().all(axis=1)
+        left_unmatched_frames.append(merged_triple[mask_vpfs_unmatched].assign(source="left_vs_vpfs"))
+    export_unmatched_left = pd.concat(left_unmatched_frames, ignore_index=True, sort=False) if left_unmatched_frames else merged_triple.iloc[0:0].copy()
+    export_unmatched_left = build_triple_adjacent_export_df(build_triple_comparison(export_unmatched_left.copy()) if not export_unmatched_left.empty else export_unmatched_left.copy()) if not export_unmatched_left.empty else export_unmatched_left
+    if not export_unmatched_left.empty:
+        export_unmatched_left.loc[:, "diff_columns"] = build_triple_diff_columns_series(build_triple_comparison(export_unmatched_left.copy()))
+
+    # 未覆盖（右）：HSBC base 的 Security ID 未出现在 comparison，及 VPFS 的 prodid_norm 未出现在 spectra id_value
+    # HSBC 右侧未覆盖
+    comp_hsbc_ids = set(export_comp.get("HSBC security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
+    if "Security ID" in hsbc_base.columns:
+        hsbc_ids_all = hsbc_base["Security ID"].astype(str).str.strip().str.upper()
+        rhs_missing_hsbc = hsbc_base[~hsbc_ids_all.isin(comp_hsbc_ids)].copy()
+    else:
+        rhs_missing_hsbc = hsbc_base.iloc[0:0].copy()
+    # VPFS 右侧未覆盖
+    spectra_ids = set(export_comp.get("spectra security ID", pd.Series(dtype=str)).astype(str).str.strip().str.upper().dropna().tolist())
+    if "prodid_norm" in vpfs_triple.columns:
+        vpfs_only = vpfs_triple[~vpfs_triple["prodid_norm"].astype(str).str.strip().str.upper().isin(spectra_ids)].copy()
+    else:
+        vpfs_only = vpfs_triple.iloc[0:0].copy()
+
+    comp_rhs_hsbc_only = build_triple_comparison(rhs_missing_hsbc.copy()) if not rhs_missing_hsbc.empty else rhs_missing_hsbc.copy()
+    export_unmatched_right_hsbc = build_triple_adjacent_export_df(comp_rhs_hsbc_only) if not comp_rhs_hsbc_only.empty else comp_rhs_hsbc_only.copy()
+    if not export_unmatched_right_hsbc.empty:
+        export_unmatched_right_hsbc.loc[:, "diff_columns"] = build_triple_diff_columns_series(comp_rhs_hsbc_only)
+        export_unmatched_right_hsbc.loc[:, "source"] = "right_hsbc"
+
+    comp_rhs_vpfs_only = build_triple_comparison(vpfs_only.copy()) if not vpfs_only.empty else vpfs_only.copy()
+    export_unmatched_right_vpfs = build_triple_adjacent_export_df(comp_rhs_vpfs_only) if not comp_rhs_vpfs_only.empty else comp_rhs_vpfs_only.copy()
+    if not export_unmatched_right_vpfs.empty:
+        export_unmatched_right_vpfs.loc[:, "diff_columns"] = build_triple_diff_columns_series(comp_rhs_vpfs_only)
+        export_unmatched_right_vpfs.loc[:, "source"] = "right_vpfs"
+
+    export_unmatched = pd.concat([f for f in [export_unmatched_left, export_unmatched_right_hsbc, export_unmatched_right_vpfs] if isinstance(f, pd.DataFrame) and not f.empty], ignore_index=True, sort=False) if (not export_unmatched_left.empty or (isinstance(export_unmatched_right_hsbc, pd.DataFrame) and not export_unmatched_right_hsbc.empty) or (isinstance(export_unmatched_right_vpfs, pd.DataFrame) and not export_unmatched_right_vpfs.empty)) else pd.DataFrame(columns=export_comp.columns)
+
+    all_bytes = build_triple_all_sheets_bytes(export_comp, export_diffs, export_unmatched)
+    return {
+        "comparison": export_comp,
+        "diffs": export_diffs,
+        "unmatched": export_unmatched,
+        "duplicates": pd.DataFrame(),  # 三源模式暂不输出重复键
         "all_sheets_xlsx": all_bytes,
     }
 if __name__ == "__main__":
