@@ -1,299 +1,217 @@
-import streamlit as st
-import pandas as pd
+"""Streamlit front-end for the NAV validation pipeline."""
+from __future__ import annotations
+
 from io import BytesIO
+from typing import Sequence
 
-import config
-from compare import run_compare_from_sources, build_single_sheet_excel, SPECTRA_TO_HSBC_MAP
+import pandas as pd
+import streamlit as st
+
+from nav_checker import (
+    NavValidationContext,
+    NavValidator,
+    SpectraInboundRepository,
+    ValidateNavUseCase,
+    HsbcAuthoritativeRepository,
+)
+from nav_checker.domain.models import NavRecord
+from nav_checker.domain.results import ValidationReport
+from nav_checker.presentation.diff_report import discrepancies_to_rows, render_csv, render_html
+from nav_checker.infrastructure.storage import mapping_store
 
 
-st.set_page_config(page_title="Excel Compare", layout="wide")
-st.title("Excel Compare Tool")
+st.set_page_config(page_title="NAV Validator", layout="wide")
+st.title("NAV Validation Tool")
 
-# 持久化页面状态，避免任意按钮导致回到上传视图
+
+def load_mapping_dataframe() -> pd.DataFrame:
+    mapping = mapping_store.load_mapping()
+    return pd.DataFrame(
+        [{"key": key, "value": value, "delete": False} for key, value in sorted(mapping.items())],
+        columns=["key", "value", "delete"],
+    )
+
+
+def records_to_dataframe(records: Sequence[NavRecord]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "instrument_id": r.identity.instrument_id,
+                "date": r.identity.nav_date,
+                "currency": r.identity.currency,
+                "share_class": r.identity.share_class,
+                "nav": r.nav,
+                "source": r.source,
+                "file_hash": r.file_hash,
+                "as_of": r.as_of,
+                "lineage": r.lineage,
+            }
+            for r in records
+        ]
+    )
+
+
+def run_validation(spectra_bytes: bytes, hsbc_bytes: bytes) -> tuple[ValidationReport, Sequence[NavRecord], Sequence[NavRecord]]:
+    inbound_repo = SpectraInboundRepository(BytesIO(spectra_bytes))
+    authoritative_repo = HsbcAuthoritativeRepository(BytesIO(hsbc_bytes))
+    context = NavValidationContext(
+        inbound_repository=inbound_repo,
+        authoritative_repository=authoritative_repo,
+        validator=NavValidator(),
+    )
+    use_case = ValidateNavUseCase(context)
+    return use_case.execute()
+
+
 if "view" not in st.session_state:
     st.session_state["view"] = "compare"
 if "result" not in st.session_state:
     st.session_state["result"] = None
 
+
 if st.session_state["view"] == "compare":
     col1, col2 = st.columns(2)
     with col1:
-        spectra_file = st.file_uploader("Upload spectra.xls", type=["xls", "xlsx"]) 
+        spectra_file = st.file_uploader("Upload Spectra file", type=["xls", "xlsx"])
     with col2:
-        hsbc_file = st.file_uploader("Upload HSBC Position Appraisal Report (EXCEL).xlsx", type=["xlsx", "xls"]) 
+        hsbc_file = st.file_uploader("Upload HSBC file", type=["xls", "xlsx"])
 
-    # 显示并编辑当前的 missing_isin_or_stack_code_mapping_dict
-    st.subheader("Security 映射管理")
-    with st.expander("missing_isin_or_stack_code_mapping_dict（增删改查）", expanded=True):
-        # 上次操作后的网页提示（toast），通过 session_state 传递跨 rerun 显示
-        if "notify" in st.session_state:
-            _n = st.session_state.pop("notify")
-            _msg = _n.get("message", "")
-            _typ = _n.get("type", "info")
-            _icon = "✅" if _typ == "add" else ("🗑️" if _typ == "delete" else "ℹ️")
-            st.toast(_msg, icon=_icon)
-        st.markdown(
-            "- 在下方‘搜索’中输入关键字进行【查】（按 Key/Value 模糊匹配）\n"
-            "- 直接在表格中修改 Value 完成【改】；可新增行完成【增】\n"
-            "- 勾选‘删除’列并点击‘删除勾选项’完成【删】\n"
-            "- 点击‘保存’写入 mapping_override.json 并立即生效"
-        )
-        current_map = config.missing_isin_or_stack_code_mapping_dict
-        # 搜索过滤（大小写不敏感）
-        search_text = st.text_input("搜索 Key/Value（模糊匹配，忽略大小写）", key="mapping_search")
-        # 构造完整表（将 delete 放到最后，便于稳定缩窄宽度）
-        full_items = [{"key": k, "value": v, "delete": False} for k, v in current_map.items()]
-        full_df = pd.DataFrame(full_items, columns=["key", "value", "delete"]) if full_items else pd.DataFrame(columns=["key", "value", "delete"]) 
-        # 过滤视图
+    st.subheader("Security Mapping Editor")
+    with st.expander("Manage missing ISIN / stack code mapping", expanded=True):
+        mapping_df = load_mapping_dataframe()
+        search_text = st.text_input("Search key/value", key="mapping_search")
         if search_text:
-            s = str(search_text).strip().upper()
-            mask = full_df.apply(lambda r: (str(r.get("key", "")).upper().find(s) >= 0) or (str(r.get("value", "")).upper().find(s) >= 0), axis=1)
-            view_df_src = full_df[mask].copy()
+            pattern = str(search_text).strip().lower()
+            mask = mapping_df.apply(
+                lambda row: pattern in str(row.get("key", "")).lower()
+                or pattern in str(row.get("value", "")).lower(),
+                axis=1,
+            )
+            view_df = mapping_df[mask].copy()
         else:
-            view_df_src = full_df.copy()
-        st.caption(f"共 {len(full_df)} 条；当前显示 {len(view_df_src)} 条")
-        # 收窄 delete 列宽（尽量贴近复选框宽度）
-        st.markdown(
-            """
-            <style>
-            [data-testid=\"stDataEditor\"] table thead th:last-child,
-            [data-testid=\"stDataEditor\"] table tbody td:last-child {
-                width: 52px;
-                max-width: 52px;
-                min-width: 44px;
-                padding-left: 8px;
-                padding-right: 8px;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        # 渲染可编辑
+            view_df = mapping_df.copy()
+        st.caption(f"Total {len(mapping_df)} entries; showing {len(view_df)}")
         edited_df = st.data_editor(
-            view_df_src,
+            view_df,
             num_rows="dynamic",
-            use_container_width=True,
             hide_index=True,
             key="mapping_editor",
-            column_config={
-                "key": st.column_config.TextColumn(
-                    "Key",
-                ),
-                "value": st.column_config.TextColumn(
-                    "Value",
-                ),
-                "delete": st.column_config.CheckboxColumn(
-                    "删",
-                    help="勾选后点击‘删除勾选项’",
-                    default=False,
-                ),
-            },
+            use_container_width=True,
         )
-        # 新增表单（单独入口，强提示）
-        col_add1, col_add2, col_add3 = st.columns([2,2,1])
+
+        col_add1, col_add2, col_add3 = st.columns([2, 2, 1])
         with col_add1:
-            new_key = st.text_input("新增 Key（不区分大小写）", key="new_map_key")
+            new_key = st.text_input("New key", key="new_map_key")
         with col_add2:
-            new_val = st.text_input("新增 Value（HSBC Security ID）", key="new_map_val")
+            new_val = st.text_input("New value", key="new_map_val")
         with col_add3:
-            add_entry = st.button("添加", key="add_mapping_btn")
+            add_entry = st.button("Add", key="add_mapping_btn")
 
-        col_ops1, col_ops2 = st.columns([1,1])
+        col_ops1, col_ops2 = st.columns([1, 1])
         with col_ops1:
-            del_selected = st.button("删除勾选项", key="delete_selected_btn")
+            del_selected = st.button("Delete selected", key="delete_selected_btn")
         with col_ops2:
-            save_mapping = st.button("保存", key="save_mapping_btn")
+            save_mapping = st.button("Save", key="save_mapping_btn")
 
-        # 将视图编辑结果合并回完整表（避免过滤导致未显示行丢失）
-        def merge_view_to_full(full_df_in: pd.DataFrame, view_df_edited: pd.DataFrame) -> pd.DataFrame:
+        def merge_view(full_df: pd.DataFrame, view_df_edited: pd.DataFrame) -> pd.DataFrame:
             if not isinstance(view_df_edited, pd.DataFrame):
-                return full_df_in.copy()
-            # 统一键格式
+                return full_df.copy()
             view_df_edited = view_df_edited.copy()
             view_df_edited["key"] = view_df_edited["key"].astype(str).str.strip()
-            # 剔除空 key
             view_df_edited = view_df_edited[view_df_edited["key"] != ""]
-            # 视图中的键集合
-            view_keys = set(view_df_edited["key"].str.upper().tolist())
-            # 保留视图外的原始行
-            rest = full_df_in[~full_df_in["key"].astype(str).str.upper().isin(view_keys)].copy()
-            # 合并：视图编辑行 + 其他行
+            view_keys = set(view_df_edited["key"].str.upper())
+            rest = full_df[~full_df["key"].str.upper().isin(view_keys)].copy()
             merged = pd.concat([rest, view_df_edited], ignore_index=True)
             return merged
 
-        # 处理『增』
         if add_entry:
-            try:
-                k = (new_key or "").strip()
-                v = (new_val or "").strip()
-                if not k:
-                    st.warning("Key 不能为空")
-                else:
-                    k_up = k.upper()
-                    v_up = v.upper()
-                    new_map = dict(current_map)
-                    new_map[k_up] = v_up
-                    config.save_mapping_override(new_map)
-                    st.session_state["notify"] = {"type": "add", "message": f"已添加/更新条目：{k_up} -> {v_up}"}
-                    st.rerun()
-            except Exception as e:
-                st.error(f"添加失败: {e}")
+            key = (new_key or "").strip().upper()
+            value = (new_val or "").strip().upper()
+            if not key:
+                st.warning("Key cannot be empty")
+            else:
+                merged = merge_view(mapping_df, edited_df)
+                merged = pd.concat(
+                    [merged, pd.DataFrame([{"key": key, "value": value, "delete": False}])],
+                    ignore_index=True,
+                )
+                merged_clean = {row["key"].upper(): str(row["value"]).upper() for _, row in merged.iterrows() if row["key"]}
+                mapping_store.save_mapping(merged_clean)
+                st.success(f"Added {key} -> {value}")
+                st.experimental_rerun()
 
-        # 处理『删』
         if del_selected:
-            try:
-                merged_df = merge_view_to_full(full_df, edited_df)
-                deleted_count = int(merged_df["delete"].sum()) if "delete" in merged_df.columns else 0
-                kept = merged_df[~merged_df["delete"].astype(bool)].copy() if "delete" in merged_df.columns else merged_df
-                new_map: dict[str, str] = {}
-                for _, row in kept.iterrows():
-                    k = str(row.get("key", "")).strip()
-                    v = row.get("value", "")
-                    if k:
-                        k_up = k.upper()
-                        v_str = "" if pd.isna(v) else str(v).strip()
-                        new_map[k_up] = v_str.upper()
-                config.save_mapping_override(new_map)
-                st.session_state["notify"] = {"type": "delete", "message": f"已删除 {deleted_count} 条并保存。"}
-                st.rerun()
-            except Exception as e:
-                st.error(f"删除失败: {e}")
+            merged = merge_view(mapping_df, edited_df)
+            if "delete" in merged.columns:
+                merged = merged[~merged["delete"].astype(bool)]
+            cleaned = {row["key"].upper(): str(row["value"]).upper() for _, row in merged.iterrows() if row["key"]}
+            mapping_store.save_mapping(cleaned)
+            st.success("Deleted selected entries")
+            st.experimental_rerun()
+
         if save_mapping:
-            try:
-                merged_df = merge_view_to_full(full_df, edited_df)
-                new_map: dict[str, str] = {}
-                for _, row in merged_df.iterrows():
-                    k = str(row.get("key", "")).strip()
-                    v = row.get("value", "")
-                    if k:
-                        k_up = k.upper()
-                        v_str = "" if pd.isna(v) else str(v).strip()
-                        new_map[k_up] = v_str.upper()
-                config.save_mapping_override(new_map)
-                st.success(f"已保存到 mapping_override.json，并刷新内存映射，共 {len(config.missing_isin_or_stack_code_mapping_dict)} 条。")
-                st.rerun()
-            except Exception as e:
-                st.error(f"保存失败: {e}")
+            merged = merge_view(mapping_df, edited_df)
+            cleaned = {row["key"].upper(): str(row["value"]).upper() for _, row in merged.iterrows() if row["key"]}
+            mapping_store.save_mapping(cleaned)
+            st.success("Mapping saved")
+            st.experimental_rerun()
 
-    run_btn = st.button("Run Compare", disabled=not (spectra_file and hsbc_file))
-
+    run_btn = st.button("Run Validation", disabled=not (spectra_file and hsbc_file))
     if run_btn and spectra_file and hsbc_file:
-        spectra_bytes = BytesIO(spectra_file.read())
-        hsbc_bytes = BytesIO(hsbc_file.read())
-        with st.spinner("Comparing…"):
-            result = run_compare_from_sources(spectra_bytes, hsbc_bytes)
-        st.session_state["result"] = result
+        spectra_bytes = spectra_file.read()
+        hsbc_bytes = hsbc_file.read()
+        with st.spinner("Validating..."):
+            report, inbound_records, authoritative_records = run_validation(spectra_bytes, hsbc_bytes)
+        st.session_state["result"] = {
+            "report": report,
+            "inbound": inbound_records,
+            "authoritative": authoritative_records,
+            "diff_csv": render_csv(tuple(report.iter_all_discrepancies())),
+            "diff_html": render_html(report),
+        }
         st.session_state["view"] = "results"
-        st.rerun()
+        st.experimental_rerun()
 else:
-    # 左上角返回按钮：仅当用户主动点击时回到上传页；其他按钮不会改变视图
-    back_clicked = st.button("← 返回", key="back_to_compare")
+    back_clicked = st.button("← Back", key="back_to_compare")
     if back_clicked:
         st.session_state["view"] = "compare"
         st.session_state["result"] = None
-        st.rerun()
+        st.experimental_rerun()
 
-    result = st.session_state["result"] or {}
+    result = st.session_state.get("result")
+    if not result:
+        st.info("No results available. Upload files and run validation first.")
+    else:
+        report: ValidationReport = result["report"]
+        inbound_records: Sequence[NavRecord] = result["inbound"]
+        authoritative_records: Sequence[NavRecord] = result["authoritative"]
 
-    # 将 diffs 放到第一个并默认显示
-    tabs = st.tabs(["diffs", "comparison", "unmatched", "duplicates"]) 
-    for tab_name, tab in zip(["diffs", "comparison", "unmatched", "duplicates"], tabs):
-        with tab:
-            df: pd.DataFrame = result.get(tab_name, pd.DataFrame())
-            if tab_name == "diffs" and not df.empty:
-                # 紧凑展示（固定参数）：显示所有列、紧凑密度、冻结首列、固定高度
-                compact_mode = True
-                table_height = 520
-                view_df = df
+        st.subheader("Summary")
+        summary = report.summary
+        st.metric("Inbound records", summary.total_inbound)
+        st.metric("Authoritative records", summary.total_authoritative)
+        st.metric("Wrong numbers", summary.wrong_numbers)
+        st.metric("Missing in inbound", summary.missing_in_inbound)
+        st.metric("Unauthorized inbound", summary.unauthorized_in_inbound)
+        st.metric("Duplicates", summary.duplicates)
 
-                # Web 端高亮：按 base_df 的 equal 列对左右值列染色
-                def style_diffs(view: pd.DataFrame, base: pd.DataFrame):
-                    styler = view.style
-                    # 隐藏索引（兼容不同 pandas 版本）
-                    try:
-                        styler = styler.hide(axis="index")
-                    except Exception:
-                        try:
-                            styler = styler.hide_index()
-                        except Exception:
-                            pass
-                    for field in SPECTRA_TO_HSBC_MAP.keys():
-                        left_alias = f"{field}__spectra"
-                        right_alias = f"{field}__hsbc"
-                        equal_col = f"{field}__equal"
-                        if equal_col in base.columns:
-                            cond = ~base[equal_col].fillna(False)
-                            colors = ["background-color: #ffff00" if v else "" for v in cond.tolist()]
-                            if left_alias in view.columns:
-                                styler = styler.apply(lambda s, c=colors: c, subset=[left_alias])
-                            if right_alias in view.columns:
-                                styler = styler.apply(lambda s, c=colors: c, subset=[right_alias])
-                    try:
-                        styler = styler.format(precision=6)
-                    except Exception:
-                        pass
-                    return styler
-
-                styled = style_diffs(view_df, df)
-
-                css = f"""
-                <style>
-                .diff-container {{
-                    max-height: {table_height}px;
-                    overflow: auto;
-                    border: 1px solid #e5e7eb;
-                    border-radius: 6px;
-                }}
-                .diff-container table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                .diff-container thead th {{
-                    position: sticky;
-                    top: 0;
-                    background: #ffffff;
-                    z-index: 2;
-                    box-shadow: 0 1px 0 rgba(0,0,0,0.06);
-                }}
-                .diff-container td, .diff-container th {{
-                    padding: {"4px 8px" if compact_mode else "8px 10px"};
-                    font-size: {"12px" if compact_mode else "14px"};
-                    white-space: nowrap;
-                }}
-                .diff-container tbody tr:nth-child(even) td {{
-                    background-color: #fafafa;
-                }}
-                .diff-container tbody td:first-child,
-                .diff-container thead th:first-child {{
-                    position: sticky;
-                    left: 0;
-                    background: #ffffff;
-                    z-index: 3;
-                    box-shadow: 1px 0 0 rgba(0,0,0,0.04);
-                }}
-                </style>
-                """
-                st.markdown(css, unsafe_allow_html=True)
-                st.markdown(f'<div class="diff-container">{styled.to_html()}</div>', unsafe_allow_html=True)
-            else:
-                st.dataframe(df, use_container_width=True)
-
-            if not df.empty:
-                xlsx_bytes = build_single_sheet_excel(df, sheet_name=tab_name)
-                st.download_button(
-                    label=f"Download {tab_name} (Excel)",
-                    data=xlsx_bytes,
-                    file_name=f"{tab_name}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-    st.divider()
-    if "all_sheets_xlsx" in result:
-        st.download_button(
-            label="Download all sheets (Excel with Diff Highlight)",
-            data=result["all_sheets_xlsx"],
-            file_name="comparison_all.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-
+        tabs = st.tabs(["Diffs", "Inbound", "Authoritative"])
+        with tabs[0]:
+            discrepancies_df = pd.DataFrame(discrepancies_to_rows(tuple(report.iter_all_discrepancies())))
+            st.dataframe(discrepancies_df)
+            st.download_button(
+                "Download diff CSV",
+                data=result["diff_csv"],
+                file_name="nav_diff.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                "Download diff HTML",
+                data=result["diff_html"].encode("utf-8"),
+                file_name="nav_diff.html",
+                mime="text/html",
+            )
+        with tabs[1]:
+            st.dataframe(records_to_dataframe(inbound_records))
+        with tabs[2]:
+            st.dataframe(records_to_dataframe(authoritative_records))
