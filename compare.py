@@ -457,7 +457,7 @@ def build_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
 
     front_cols = [c for c in [
         "id_type", "id_value", "_type_raw",
-        "spectra security ID", "HSBC security ID", "Isin", "Ticker"
+        "spectra security ID", "HSBC security ID", "VPFS_security ID", "Isin", "Ticker"
     ] if c in comp.columns]
     ordered_cols: list[str] = front_cols.copy()
 
@@ -703,28 +703,31 @@ def vpfs_normalize(df: pd.DataFrame) -> pd.DataFrame:
             work = work[~mask_skip].copy()
     else:
         # 无 prodid 列则返回空框架，后续合并为完全未匹配
-        return pd.DataFrame(columns=["prodid_norm", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"])  # type: ignore[list-item]
+        return pd.DataFrame(columns=["prodid_norm", "VPFS_security ID", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"])  # type: ignore[list-item]
 
     # 规范化 prodid 作为连接键
     work.loc[:, "prodid_norm"] = work["prodid"].astype(str).str.strip().str.upper()
+    # 添加 VPFS_security ID 列，值为原始的 prodid
+    work.loc[:, "VPFS_security ID"] = work["prodid"]
 
     # 将 VPFS 数值列映射为右侧标准列（沿用 HSBC 列名，以便复用比较/导出逻辑）
-    # 映射关系：valqty→Quantity，valprice→Local Market Price，MarketValue→Local Market Value，FundCCYTotalCost→Book Market Value
+    # 映射关系：valqty→Quantity，valprice→Local Market Price，MarketValue→Local Market Value，FundCCYMarketValue→Book Market Value
     target_cols = {
         "valqty": "Quantity",
         "valprice": "Local Market Price",
         "marketvalue": "Local Market Value",
-        "fundccytotalcost": "Book Market Value",
+        "fundccymarketvalue": "Book Market Value",
     }
     present = {src: tgt for src, tgt in target_cols.items() if src in work.columns}
-    use_cols = ["prodid_norm"] + list(present.keys())
+    use_cols = ["prodid_norm", "VPFS_security ID"] + list(present.keys())
     use = work[use_cols].copy()
     use = use.rename(columns=present)
     # 确保所有目标列存在（缺失列补空）
     for tgt in target_cols.values():
         if tgt not in use.columns:
             use.loc[:, tgt] = pd.Series(dtype=object)
-    return use[["prodid_norm", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"]].copy()
+    
+    return use[["prodid_norm", "VPFS_security ID", "Quantity", "Local Market Price", "Local Market Value", "Book Market Value"]].copy()
 
 
 def run_compare_spectra_vs_vpfs(spectra_src: Path | BytesIO, vpfs_src: Path | BytesIO) -> dict:
@@ -922,6 +925,11 @@ def _vpfs_for_triple(vpfs_norm: pd.DataFrame) -> pd.DataFrame:
             work = work.rename(columns={src: tgt})
         else:
             work.loc[:, tgt] = pd.Series(dtype=object)
+    
+    # 保留 VPFS_security ID 列（如果存在）
+    if "VPFS_security ID" not in work.columns:
+        work["VPFS_security ID"] = pd.Series(dtype=object)
+    
     return work
 
 
@@ -999,7 +1007,7 @@ def build_triple_adjacent_export_df(comp: pd.DataFrame) -> pd.DataFrame:
 
     front_cols = [c for c in [
         "id_type", "id_value", "_type_raw",
-        "spectra security ID", "HSBC security ID", "Isin", "Ticker"
+        "spectra security ID", "HSBC security ID", "VPFS_security ID", "Isin", "Ticker"
     ] if c in work.columns]
     ordered_cols: list[str] = front_cols.copy()
 

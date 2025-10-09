@@ -315,17 +315,50 @@ else:
                             styler = styler.hide_index()
                         except Exception:
                             pass
-                    for field in SPECTRA_TO_HSBC_MAP.keys():
-                        left_alias = f"{field}__spectra"
-                        right_alias = f"{field}__hsbc"
-                        equal_col = f"{field}__equal"
-                        if equal_col in base.columns:
-                            cond = ~base[equal_col].fillna(False)
-                            colors = ["background-color: #ffff00" if v else "" for v in cond.tolist()]
-                            if left_alias in view.columns:
-                                styler = styler.apply(lambda s, c=colors: c, subset=[left_alias])
-                            if right_alias in view.columns:
-                                styler = styler.apply(lambda s, c=colors: c, subset=[right_alias])
+                    
+                    # 检测是否为三源模式（存在 __equal_hsbc 或 __equal_vpfs 列）
+                    is_triple_mode = any(f"{field}__equal_hsbc" in base.columns or f"{field}__equal_vpfs" in base.columns for field in SPECTRA_TO_HSBC_MAP.keys())
+                    
+                    if is_triple_mode:
+                        # 三源模式：分别处理 HSBC 和 VPFS
+                        for field in SPECTRA_TO_HSBC_MAP.keys():
+                            left_alias = f"{field}__spectra"
+                            hsbc_alias = f"{field}__hsbc"
+                            vpfs_alias = f"{field}__vpfs"
+                            hsbc_equal_col = f"{field}__equal_hsbc"
+                            vpfs_equal_col = f"{field}__equal_vpfs"
+                            
+                            # HSBC 高亮
+                            if hsbc_equal_col in base.columns:
+                                cond_hsbc = ~base[hsbc_equal_col].fillna(False)
+                                colors_hsbc = ["background-color: #ffff00" if v else "" for v in cond_hsbc.tolist()]
+                                if left_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors_hsbc: c, subset=[left_alias])
+                                if hsbc_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors_hsbc: c, subset=[hsbc_alias])
+                            
+                            # VPFS 高亮
+                            if vpfs_equal_col in base.columns:
+                                cond_vpfs = ~base[vpfs_equal_col].fillna(False)
+                                colors_vpfs = ["background-color: #ffff00" if v else "" for v in cond_vpfs.tolist()]
+                                if left_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors_vpfs: c, subset=[left_alias])
+                                if vpfs_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors_vpfs: c, subset=[vpfs_alias])
+                    else:
+                        # 双源模式：HSBC 或 VPFS
+                        for field in SPECTRA_TO_HSBC_MAP.keys():
+                            left_alias = f"{field}__spectra"
+                            right_alias = f"{field}__hsbc"
+                            equal_col = f"{field}__equal"
+                            if equal_col in base.columns:
+                                cond = ~base[equal_col].fillna(False)
+                                colors = ["background-color: #ffff00" if v else "" for v in cond.tolist()]
+                                if left_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors: c, subset=[left_alias])
+                                if right_alias in view.columns:
+                                    styler = styler.apply(lambda s, c=colors: c, subset=[right_alias])
+                    
                     try:
                         styler = styler.format(precision=6)
                     except Exception:
